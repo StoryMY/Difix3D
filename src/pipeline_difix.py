@@ -980,7 +980,7 @@ class DifixPipeline(
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = self._execution_device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # 3. Encode input prompt
         lora_scale = (
@@ -1020,18 +1020,42 @@ class DifixPipeline(
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
 
-        # 5. Prepare latent variables
-        latents = self.prepare_latents(
-            torch.cat([image, ref_image], dim=0) if ref_image is not None else image,
-            batch_size,
-            num_images_per_prompt,
-            prompt_embeds.dtype,
-            device,
-            generator,
-        )
-
+        # 5. Prepare latent variables.
+        pseudo_skip_acts = None
         if ref_image is not None:
-            prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)
+            if image.shape[0] != ref_image.shape[0]:
+                raise ValueError("`image` and `ref_image` must have the same batch size.")
+
+            pair_latents = []
+            for index in range(batch_size):
+                pair_generator = generator[index] if isinstance(generator, list) else generator
+                pair_latents.append(
+                    self.prepare_latents(
+                        torch.cat([image[index : index + 1], ref_image[index : index + 1]], dim=0),
+                        1,
+                        num_images_per_prompt,
+                        prompt_embeds.dtype,
+                        device,
+                        pair_generator,
+                    )
+                )
+                if pseudo_skip_acts is None:
+                    pseudo_skip_acts = [[] for _ in self.vae.encoder.current_down_blocks]
+                for skip_index, skip_acts in enumerate(self.vae.encoder.current_down_blocks):
+                    pseudo_skip_acts[skip_index].append(skip_acts[:1])
+
+            latents = torch.cat(pair_latents, dim=0)
+            pseudo_skip_acts = [torch.cat(skip_acts, dim=0) for skip_acts in pseudo_skip_acts]
+            prompt_embeds = prompt_embeds.repeat_interleave(2, dim=0)
+        else:
+            latents = self.prepare_latents(
+                image,
+                batch_size,
+                num_images_per_prompt,
+                prompt_embeds.dtype,
+                device,
+                generator,
+            )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1082,7 +1106,9 @@ class DifixPipeline(
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
-                self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
+                self.vae.decoder.incoming_skip_acts = (
+                    pseudo_skip_acts if pseudo_skip_acts is not None else self.vae.encoder.current_down_blocks
+                )
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -1102,7 +1128,7 @@ class DifixPipeline(
                         callback(step_idx, t, latents)
         
         if ref_image is not None:
-            latents = latents.chunk(2, dim=0)[0]
+            latents = latents[::2]
 
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[
@@ -1118,8 +1144,6 @@ class DifixPipeline(
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
-        if ref_image is not None:
-            image = image.chunk(2, dim=0)[0]
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
         # Offload all models
