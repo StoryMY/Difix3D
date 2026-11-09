@@ -38,7 +38,7 @@ accelerate launch \
     "${launch_args[@]}" \
     --num_machines 1 \
     --num_processes "$num_gpus" \
-    --main_process_port 0 \
+    --main_process_port 29501 \
     --mixed_precision "$mixed_precision" \
     src/train_difix.py \
     --dataset_path "$dataset_path" \
