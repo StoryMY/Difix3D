@@ -49,7 +49,6 @@ def main(args):
 
     if accelerator.is_main_process:
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
-        os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
     if args.pretrained_model_name_or_path == "nvidia/difix_ref" and not args.mv_unet:
         raise ValueError("nvidia/difix_ref requires --mv_unet and ref_image in every sample.")
