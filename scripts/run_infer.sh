@@ -1,4 +1,5 @@
 # 模型
+model_name="nvidia/difix_ref"
 model_path="/path/to/pkl"
 
 # 输入与输出
@@ -13,6 +14,7 @@ timestep="199"
 prompt="remove degradation"
 
 python src/inference_difix.py \
+    --model_name "$model_name" \
     --model_path "$model_path" \
     --input_image "$input_image" \
     --ref_image "$ref_image" \

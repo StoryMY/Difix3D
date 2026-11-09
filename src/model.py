@@ -141,8 +141,6 @@ def save_ckpt(net_difix, optimizer, outf, lr_scheduler=None):
 class Difix(torch.nn.Module):
     def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_vae=4, mv_unet=False, timestep=999):
         super().__init__()
-        if pretrained_name is not None and pretrained_path is not None:
-            raise ValueError("Choose a pretrained model or a checkpoint, not both.")
         self.mv_unet = mv_unet
         base_name = pretrained_name or "stabilityai/sd-turbo"
         self.tokenizer = CLIPTokenizer.from_pretrained(base_name, subfolder="tokenizer")
@@ -178,14 +176,6 @@ class Difix(torch.nn.Module):
             sd = torch.load(pretrained_path, map_location="cpu")
             vae_lora_config = LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian", target_modules=sd["vae_lora_target_modules"])
             vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
-            _sd_vae = vae.state_dict()
-            for k in sd["state_dict_vae"]:
-                _sd_vae[k] = sd["state_dict_vae"][k]
-            vae.load_state_dict(_sd_vae)
-            _sd_unet = unet.state_dict()
-            for k in sd["state_dict_unet"]:
-                _sd_unet[k] = sd["state_dict_unet"][k]
-            unet.load_state_dict(_sd_unet)
             self.lora_rank_vae = sd["rank_vae"]
             self.target_modules_vae = sd["vae_lora_target_modules"]
 
@@ -225,6 +215,15 @@ class Difix(torch.nn.Module):
                     filename = hf_hub_download(pretrained_name, f"{component}/diffusion_pytorch_model.safetensors")
                 module.load_state_dict(load_file(filename), strict=True)
             print(f"Loaded pretrained weights from {pretrained_name}")
+
+        if pretrained_path is not None:
+            # Overlay last so the base model cannot overwrite fine-tuned weights.
+            for component, module in (("unet", unet), ("vae", vae)):
+                state = module.state_dict()
+                state.update(sd[f"state_dict_{component}"])
+                module.load_state_dict(state, strict=True)
+            del sd
+            print(f"Loaded checkpoint from {pretrained_path}")
 
         # unet.enable_xformers_memory_efficient_attention()
         unet.to("cuda")
