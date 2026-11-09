@@ -6,17 +6,19 @@ from PIL import Image
 from tqdm import tqdm
 import torch
 from torchvision import transforms
-from transformers import AutoTokenizer, CLIPTextModel
+from transformers import CLIPTokenizer, CLIPTextModel
 from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler
 from peft import LoraConfig
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 p = "src/"
 sys.path.append(p)
 from einops import rearrange, repeat
 
 
-def make_1step_sched():
-    noise_scheduler_1step = DDPMScheduler.from_pretrained("stabilityai/sd-turbo", subfolder="scheduler")
-    noise_scheduler_1step.set_timesteps(1, device="cuda")
+def make_1step_sched(model_name="stabilityai/sd-turbo", timestep=199):
+    noise_scheduler_1step = DDPMScheduler.from_pretrained(model_name, subfolder="scheduler")
+    noise_scheduler_1step.set_timesteps(timesteps=[timestep], device="cuda")
     noise_scheduler_1step.alphas_cumprod = noise_scheduler_1step.alphas_cumprod.cuda()
     return noise_scheduler_1step
 
@@ -83,7 +85,7 @@ def download_url(url, outf):
         print(f"Skipping download, {outf} already exists")
 
 
-def load_ckpt_from_state_dict(net_difix, optimizer, pretrained_path):
+def load_ckpt_from_state_dict(net_difix, optimizer, pretrained_path, lr_scheduler=None):
     sd = torch.load(pretrained_path, map_location="cpu")
     
     if "state_dict_vae" in sd:
@@ -96,19 +98,42 @@ def load_ckpt_from_state_dict(net_difix, optimizer, pretrained_path):
         _sd_unet[k] = sd["state_dict_unet"][k]
     net_difix.unet.load_state_dict(_sd_unet)
         
-    optimizer.load_state_dict(sd["optimizer"])
+    optimizer_state = sd["optimizer"]
+    # The original trainer listed skip-conv LoRA parameters twice. Collapse those
+    # aliases when restoring its AdamW state into the deduplicated optimizer.
+    saved_groups = optimizer_state["param_groups"]
+    current_groups = optimizer.state_dict()["param_groups"]
+    if len(saved_groups) == len(current_groups) == 1 and len(saved_groups[0]["params"]) != len(current_groups[0]["params"]):
+        legacy_params = list(net_difix.unet.parameters())
+        legacy_params += [p for n, p in net_difix.vae.named_parameters() if "lora" in n and "vae_skip" in n]
+        for index in range(1, 5):
+            legacy_params += list(getattr(net_difix.vae.decoder, f"skip_conv_{index}").parameters())
+        if len(legacy_params) == len(saved_groups[0]["params"]):
+            old_ids = {id(p): key for p, key in zip(legacy_params, saved_groups[0]["params"])}
+            params = optimizer.param_groups[0]["params"]
+            if all(id(p) in old_ids for p in params):
+                state = {key: optimizer_state["state"][old_ids[id(p)]]
+                         for p, key in zip(params, current_groups[0]["params"])
+                         if old_ids[id(p)] in optimizer_state["state"]}
+                group = {**saved_groups[0], "params": current_groups[0]["params"]}
+                optimizer_state = {"state": state, "param_groups": [group]}
+    optimizer.load_state_dict(optimizer_state)
+    if lr_scheduler is not None and "lr_scheduler" in sd:
+        lr_scheduler.load_state_dict(sd["lr_scheduler"])
     
     return net_difix, optimizer
 
 
-def save_ckpt(net_difix, optimizer, outf):
+def save_ckpt(net_difix, optimizer, outf, lr_scheduler=None):
     sd = {}
     sd["vae_lora_target_modules"] = net_difix.target_modules_vae
     sd["rank_vae"] = net_difix.lora_rank_vae
     sd["state_dict_unet"] = net_difix.unet.state_dict()
     sd["state_dict_vae"] = {k: v for k, v in net_difix.vae.state_dict().items() if "lora" in k or "skip" in k}
     
-    sd["optimizer"] = optimizer.state_dict()   
+    sd["optimizer"] = optimizer.state_dict()
+    if lr_scheduler is not None:
+        sd["lr_scheduler"] = lr_scheduler.state_dict()
     
     torch.save(sd, outf)
 
@@ -116,11 +141,20 @@ def save_ckpt(net_difix, optimizer, outf):
 class Difix(torch.nn.Module):
     def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_vae=4, mv_unet=False, timestep=999):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").cuda()
-        self.sched = make_1step_sched()
+        if pretrained_name is not None and pretrained_path is not None:
+            raise ValueError("Choose a pretrained model or a checkpoint, not both.")
+        self.mv_unet = mv_unet
+        base_name = pretrained_name or "stabilityai/sd-turbo"
+        self.tokenizer = CLIPTokenizer.from_pretrained(base_name, subfolder="tokenizer")
+        self.text_encoder = CLIPTextModel.from_pretrained(base_name, subfolder="text_encoder").cuda()
+        self.sched = make_1step_sched(base_name, timestep)
 
-        vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
+        if pretrained_name:
+            vae_config = AutoencoderKL.load_config(base_name, subfolder="vae")
+            lora_rank_vae = vae_config.get("lora_rank", lora_rank_vae)
+            vae = AutoencoderKL.from_config(vae_config)
+        else:
+            vae = AutoencoderKL.from_pretrained(base_name, subfolder="vae")
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
         vae.decoder.forward = my_vae_decoder_fwd.__get__(vae.decoder, vae.decoder.__class__)
         # add the skip connection convs
@@ -135,7 +169,10 @@ class Difix(torch.nn.Module):
         else:
             from diffusers import UNet2DConditionModel
 
-        unet = UNet2DConditionModel.from_pretrained("stabilityai/sd-turbo", subfolder="unet")
+        if pretrained_name:
+            unet = UNet2DConditionModel.from_config(UNet2DConditionModel.load_config(base_name, subfolder="unet"))
+        else:
+            unet = UNet2DConditionModel.from_pretrained(base_name, subfolder="unet")
 
         if pretrained_path is not None:
             sd = torch.load(pretrained_path, map_location="cpu")
@@ -149,9 +186,11 @@ class Difix(torch.nn.Module):
             for k in sd["state_dict_unet"]:
                 _sd_unet[k] = sd["state_dict_unet"][k]
             unet.load_state_dict(_sd_unet)
+            self.lora_rank_vae = sd["rank_vae"]
+            self.target_modules_vae = sd["vae_lora_target_modules"]
 
-        elif pretrained_name is None and pretrained_path is None:
-            print("Initializing model with random weights")
+        else:
+            print(f"Initializing architecture for {base_name}")
             target_modules_vae = []
 
             torch.nn.init.constant_(vae.decoder.skip_conv_1.weight, 1e-5)
@@ -176,6 +215,16 @@ class Difix(torch.nn.Module):
                 
             self.lora_rank_vae = lora_rank_vae
             self.target_modules_vae = target_modules_vae
+
+        if pretrained_name is not None:
+            # Load into the existing training architecture, including VAE LoRA/skip weights.
+            # Strict loading prevents silently training with missing pretrained parameters.
+            for component, module in (("unet", unet), ("vae", vae)):
+                filename = os.path.join(pretrained_name, component, "diffusion_pytorch_model.safetensors")
+                if not os.path.isdir(pretrained_name):
+                    filename = hf_hub_download(pretrained_name, f"{component}/diffusion_pytorch_model.safetensors")
+                module.load_state_dict(load_file(filename), strict=True)
+            print(f"Loaded pretrained weights from {pretrained_name}")
 
         # unet.enable_xformers_memory_efficient_attention()
         unet.to("cuda")
@@ -202,6 +251,8 @@ class Difix(torch.nn.Module):
         self.unet.train()
         self.vae.train()
         self.unet.requires_grad_(True)
+        self.vae.requires_grad_(False)
+        self.text_encoder.eval()
 
         for n, _p in self.vae.named_parameters():
             if "lora" in n:
@@ -214,7 +265,11 @@ class Difix(torch.nn.Module):
     def forward(self, x, timesteps=None, prompt=None, prompt_tokens=None):
         # either the prompt or the prompt_tokens should be provided
         assert (prompt is None) != (prompt_tokens is None), "Either prompt or prompt_tokens should be provided"
-        assert (timesteps is None) != (self.timesteps is None), "Either timesteps or self.timesteps should be provided"
+        timesteps = self.timesteps if timesteps is None else timesteps
+        self.sched.set_timesteps(timesteps=[int(timesteps)], device=x.device)
+        expected_views = 2 if self.mv_unet else 1
+        if x.shape[1] != expected_views:
+            raise ValueError(f"Expected {expected_views} views, got {x.shape[1]}; check ref_image and --mv_unet.")
         
         if prompt is not None:
             # encode the text prompt
@@ -222,7 +277,7 @@ class Difix(torch.nn.Module):
                                             padding="max_length", truncation=True, return_tensors="pt").input_ids.cuda()
             caption_enc = self.text_encoder(caption_tokens)[0]
         else:
-            caption_enc = self.text_encoder(prompt_tokens)[0]
+            caption_enc = self.text_encoder(prompt_tokens.reshape(-1, prompt_tokens.shape[-1]))[0]
                                 
         num_views = x.shape[1]
         x = rearrange(x, 'b v c h w -> (b v) c h w')
@@ -231,8 +286,8 @@ class Difix(torch.nn.Module):
         
         unet_input = z
         
-        model_pred = self.unet(unet_input, self.timesteps, encoder_hidden_states=caption_enc,).sample
-        z_denoised = self.sched.step(model_pred, self.timesteps, z, return_dict=True).prev_sample
+        model_pred = self.unet(unet_input, timesteps, encoder_hidden_states=caption_enc,).sample
+        z_denoised = self.sched.step(model_pred, timesteps, z, return_dict=True).prev_sample
         self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
         output_image = (self.vae.decode(z_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
         output_image = rearrange(output_image, '(b v) c h w -> b v c h w', v=num_views)
@@ -263,12 +318,4 @@ class Difix(torch.nn.Module):
         return output_pil
 
     def save_model(self, outf, optimizer):
-        sd = {}
-        sd["vae_lora_target_modules"] = self.target_modules_vae
-        sd["rank_vae"] = self.lora_rank_vae
-        sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
-        sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
-        
-        sd["optimizer"] = optimizer.state_dict()
-        
-        torch.save(sd, outf)
+        save_ckpt(self, optimizer, outf)

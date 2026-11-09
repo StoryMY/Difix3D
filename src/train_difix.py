@@ -1,5 +1,7 @@
 import os
 import gc
+import math
+from pathlib import Path
 import lpips
 import random
 import argparse
@@ -22,18 +24,17 @@ import diffusers
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.optimization import get_scheduler
 
-import wandb
-
 from model import Difix, load_ckpt_from_state_dict, save_ckpt
 from dataset import PairedDataset
 from loss import gram_loss
+from visualization import save_comparisons
 
 
 def main(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=None if args.report_to in ("none", "local") else args.report_to,
     )
 
     if accelerator.is_local_main_process:
@@ -50,7 +51,13 @@ def main(args):
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
+    if args.pretrained_model_name_or_path == "nvidia/difix_ref" and not args.mv_unet:
+        raise ValueError("nvidia/difix_ref requires --mv_unet and ref_image in every sample.")
+    if args.resolution < 8 or args.resolution % 8:
+        raise ValueError("--resolution must be a positive multiple of 8.")
+
     net_difix = Difix(
+        pretrained_name=args.pretrained_model_name_or_path,
         lora_rank_vae=args.lora_rank_vae, 
         timestep=args.timestep,
         mv_unet=args.mv_unet,
@@ -73,22 +80,12 @@ def main(args):
 
     net_lpips.requires_grad_(False)
     
-    net_vgg = torchvision.models.vgg16(pretrained=True).features
-    for param in net_vgg.parameters():
-        param.requires_grad_(False)
+    net_vgg = None
+    if args.lambda_gram > 0:
+        net_vgg = torchvision.models.vgg16(pretrained=True).features.eval().requires_grad_(False)
 
-    # make the optimizer
-    layers_to_opt = []
-    layers_to_opt += list(net_difix.unet.parameters())
-   
-    for n, _p in net_difix.vae.named_parameters():
-        if "lora" in n and "vae_skip" in n:
-            assert _p.requires_grad
-            layers_to_opt.append(_p)
-    layers_to_opt = layers_to_opt + list(net_difix.vae.decoder.skip_conv_1.parameters()) + \
-        list(net_difix.vae.decoder.skip_conv_2.parameters()) + \
-        list(net_difix.vae.decoder.skip_conv_3.parameters()) + \
-        list(net_difix.vae.decoder.skip_conv_4.parameters())
+    # set_train selects the full UNet, VAE LoRA and skip connections.
+    layers_to_opt = [p for p in net_difix.parameters() if p.requires_grad]
 
     optimizer = torch.optim.AdamW(layers_to_opt, lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
@@ -98,10 +95,10 @@ def main(args):
         num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles, power=args.lr_power,)
 
-    dataset_train = PairedDataset(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer)
+    dataset_train = PairedDataset(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer, height=args.resolution, width=args.resolution)
     dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
-    dataset_val = PairedDataset(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer)
-    random.Random(42).shuffle(dataset_val.img_names)
+    dataset_val = PairedDataset(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer, height=args.resolution, width=args.resolution)
+    random.Random(42).shuffle(dataset_val.img_ids)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
     # Resume from checkpoint
@@ -111,22 +108,22 @@ def main(args):
             # Resume from last ckpt
             ckpt_files = glob(os.path.join(args.resume, "*.pkl"))
             assert len(ckpt_files) > 0, f"No checkpoint files found: {args.resume}"
-            ckpt_files = sorted(ckpt_files, key=lambda x: int(x.split("/")[-1].replace("model_", "").replace(".pkl", "")))
+            ckpt_files = sorted(ckpt_files, key=lambda x: int(Path(x).name.replace("model_", "").replace(".pkl", "")))
             print("="*50); print(f"Loading checkpoint from {ckpt_files[-1]}"); print("="*50)
-            global_step = int(ckpt_files[-1].split("/")[-1].replace("model_", "").replace(".pkl", ""))
+            global_step = int(Path(ckpt_files[-1]).name.replace("model_", "").replace(".pkl", ""))
             net_difix, optimizer = load_ckpt_from_state_dict(
-                net_difix, optimizer, ckpt_files[-1]
+                net_difix, optimizer, ckpt_files[-1], lr_scheduler
             )
         elif args.resume.endswith(".pkl"):
             print("="*50); print(f"Loading checkpoint from {args.resume}"); print("="*50)
-            global_step = int(args.resume.split("/")[-1].replace("model_", "").replace(".pkl", ""))
+            global_step = int(Path(args.resume).name.replace("model_", "").replace(".pkl", ""))
             net_difix, optimizer = load_ckpt_from_state_dict(
-                net_difix, optimizer, args.resume
+                net_difix, optimizer, args.resume, lr_scheduler
             )    
         else:
             raise NotImplementedError(f"Invalid resume path: {args.resume}")
     else:
-        print("="*50); print(f"Training from scratch"); print("="*50)
+        print("="*50); print(f"Starting training from {args.pretrained_model_name_or_path or 'SD-Turbo'}"); print("="*50)
     
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -135,21 +132,24 @@ def main(args):
         weight_dtype = torch.bfloat16
 
     # Move al networksr to device and cast to weight_dtype
-    net_difix.to(accelerator.device, dtype=weight_dtype)
-    net_lpips.to(accelerator.device, dtype=weight_dtype)
-    net_vgg.to(accelerator.device, dtype=weight_dtype)
+    net_difix.to(accelerator.device)
+    net_lpips.to(accelerator.device)
+    if net_vgg is not None:
+        net_vgg.to(accelerator.device)
     
     # Prepare everything with our `accelerator`.
     net_difix, optimizer, dl_train, lr_scheduler = accelerator.prepare(
         net_difix, optimizer, dl_train, lr_scheduler
     )
-    net_lpips, net_vgg = accelerator.prepare(net_lpips, net_vgg)
+    net_lpips = accelerator.prepare(net_lpips)
+    if net_vgg is not None:
+        net_vgg = accelerator.prepare(net_vgg)
     # renorm with image net statistics
     t_vgg_renorm =  transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and args.report_to not in ("none", "local"):
         init_kwargs = {
             "wandb": {
                 "name": args.tracker_run_name,
@@ -163,8 +163,11 @@ def main(args):
         disable=not accelerator.is_local_main_process,)
 
     # start the training loop
-    for epoch in range(0, args.num_training_epochs):
+    num_epochs = max(args.num_training_epochs, math.ceil(args.max_train_steps / math.ceil(len(dl_train) / args.gradient_accumulation_steps)))
+    for epoch in range(num_epochs):
         for step, batch in enumerate(dl_train):
+            if global_step >= args.max_train_steps:
+                break
             l_acc = [net_difix]
             with accelerator.accumulate(*l_acc):
                 x_src = batch["conditioning_pixel_values"]
@@ -186,7 +189,7 @@ def main(args):
                 if args.lambda_gram > 0:
                     if global_step > args.gram_loss_warmup_steps:
                         x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
-                        crop_h, crop_w = 400, 400
+                        crop_h, crop_w = min(400, H), min(400, W)
                         top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
                         x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
                         
@@ -223,25 +226,21 @@ def main(args):
                     progress_bar.set_postfix(**logs)
 
                     # viz some images
-                    if global_step % args.viz_freq == 1:
-                        log_dict = {
-                            "train/source": [wandb.Image(rearrange(x_src, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                            "train/target": [wandb.Image(rearrange(x_tgt, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                            "train/model_output": [wandb.Image(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                        }
-                        for k in log_dict:
-                            logs[k] = log_dict[k]
+                    if args.report_to == "local" and args.viz_freq > 0 and global_step % args.viz_freq == 0:
+                        save_comparisons(
+                            x_src, x_tgt, x_tgt_pred,
+                            Path(args.output_dir) / "visualizations" / f"step_{global_step:08d}" / "train",
+                        )
 
                     # checkpoint the model
-                    if global_step % args.checkpointing_steps == 1:
+                    if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
                         outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
                         # accelerator.unwrap_model(net_difix).save_model(outf)
-                        save_ckpt(accelerator.unwrap_model(net_difix), optimizer, outf)
+                        save_ckpt(accelerator.unwrap_model(net_difix), optimizer, outf, lr_scheduler)
 
                     # compute validation set L2, LPIPS
-                    if args.eval_freq > 0 and global_step % args.eval_freq == 1:
+                    if args.eval_freq > 0 and global_step % args.eval_freq == 0:
                         l_l2, l_lpips = [], []
-                        log_dict = {"sample/source": [], "sample/target": [], "sample/model_output": []}
                         for step, batch_val in enumerate(dl_val):
                             if step >= args.num_samples_eval:
                                 break
@@ -249,15 +248,17 @@ def main(args):
                             x_tgt = batch_val["output_pixel_values"].to(accelerator.device, dtype=weight_dtype)
                             B, V, C, H, W = x_src.shape
                             assert B == 1, "Use batch size 1 for eval."
-                            with torch.no_grad():
+                            with torch.no_grad(), accelerator.autocast():
                                 # forward pass
                                 x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
                                 
-                                if step % 10 == 0:
-                                    log_dict["sample/source"].append(wandb.Image(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
-                                    log_dict["sample/target"].append(wandb.Image(rearrange(x_tgt, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
-                                    log_dict["sample/model_output"].append(wandb.Image(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
-                                
+                                if args.report_to == "local":
+                                    save_comparisons(
+                                        x_src, x_tgt, x_tgt_pred,
+                                        Path(args.output_dir) / "visualizations" / f"step_{global_step:08d}" / "val",
+                                        start_index=step,
+                                    )
+
                                 x_tgt = x_tgt[:, 0] # take the input view
                                 x_tgt_pred = x_tgt_pred[:, 0] # take the input view
                                 # compute the reconstruction losses
@@ -269,11 +270,17 @@ def main(args):
 
                         logs["val/l2"] = np.mean(l_l2)
                         logs["val/lpips"] = np.mean(l_lpips)
-                        for k in log_dict:
-                            logs[k] = log_dict[k]
                         gc.collect()
                         torch.cuda.empty_cache()
                     accelerator.log(logs, step=global_step)
+
+        if global_step >= args.max_train_steps:
+            break
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        save_ckpt(accelerator.unwrap_model(net_difix), optimizer,
+                  os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl"), lr_scheduler)
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
@@ -295,12 +302,12 @@ if __name__ == "__main__":
     parser.add_argument("--eval_freq", default=100, type=int)
     parser.add_argument("--num_samples_eval", type=int, default=100, help="Number of samples to use for all evaluation")
 
-    parser.add_argument("--viz_freq", type=int, default=100, help="Frequency of visualizing the outputs.")
+    parser.add_argument("--viz_freq", type=int, default=100, help="With --report_to local, save training PNGs every N updates; 0 disables training images.")
     parser.add_argument("--tracker_project_name", type=str, default="difix", help="The name of the wandb project to log to.")
     parser.add_argument("--tracker_run_name", type=str, required=True)
 
     # details about the model architecture
-    parser.add_argument("--pretrained_model_name_or_path")
+    parser.add_argument("--pretrained_model_name_or_path", help="Difix Hugging Face repo or local snapshot; use nvidia/difix_ref with --mv_unet.")
     parser.add_argument("--revision", type=str, default=None,)
     parser.add_argument("--variant", type=str, default=None,)
     parser.add_argument("--tokenizer_name", type=str, default=None)
@@ -344,10 +351,10 @@ if __name__ == "__main__":
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
         ),
     )
-    parser.add_argument("--report_to", type=str, default="wandb",
+    parser.add_argument("--report_to", type=str, default="none",
         help=(
-            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
-            ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
+            'Use "local" to save comparison PNGs, "none" (default) to disable reporting, '
+            'or an external metric tracker: "tensorboard", "wandb", "comet_ml", "all".'
         ),
     )
     parser.add_argument("--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"],)

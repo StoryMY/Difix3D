@@ -8,7 +8,7 @@ class PairedDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path, split, height=576, width=1024, tokenizer=None):
 
         super().__init__()
-        with open(dataset_path, "r") as f:
+        with open(dataset_path, "r", encoding="utf-8-sig") as f:
             self.data = json.load(f)[split]
         self.img_ids = list(self.data.keys())
         self.image_size = (height, width)
@@ -27,27 +27,16 @@ class PairedDataset(torch.utils.data.Dataset):
         ref_img = self.data[img_id]["ref_image"] if "ref_image" in self.data[img_id] else None
         caption = self.data[img_id]["prompt"]
         
-        try:
-            input_img = Image.open(input_img)
-            output_img = Image.open(output_img)
-        except:
-            print("Error loading image:", input_img, output_img)
-            return self.__getitem__(idx + 1)
+        def load_image(path):
+            with Image.open(path) as image:
+                tensor = F.to_tensor(image.convert("RGB"))
+            return F.normalize(F.resize(tensor, self.image_size), [0.5], [0.5])
 
-        img_t = F.to_tensor(img_t)
-        img_t = F.resize(img_t, self.image_size)
-        img_t = F.normalize(img_t, mean=[0.5], std=[0.5])
-
-        output_t = F.to_tensor(output_t)
-        output_t = F.resize(output_t, self.image_size)
-        output_t = F.normalize(output_t, mean=[0.5], std=[0.5])
-
+        img_t = load_image(input_img)
+        output_t = load_image(output_img)
         if ref_img is not None:
-            ref_img = Image.open(ref_img)
-            ref_t = F.to_tensor(ref_t)
-            ref_t = F.resize(ref_t, self.image_size)
-            ref_t = F.normalize(ref_t, mean=[0.5], std=[0.5])
-        
+            ref_t = load_image(ref_img)
+
             img_t = torch.stack([img_t, ref_t], dim=0)
             output_t = torch.stack([output_t, ref_t], dim=0)            
         else:
@@ -65,6 +54,6 @@ class PairedDataset(torch.utils.data.Dataset):
                 caption, max_length=self.tokenizer.model_max_length,
                 padding="max_length", truncation=True, return_tensors="pt"
             ).input_ids
-            out["input_ids"] = input_ids
+            out["input_ids"] = input_ids.squeeze(0)
 
         return out

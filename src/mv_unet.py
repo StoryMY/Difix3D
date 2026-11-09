@@ -35,7 +35,6 @@ from diffusers.models.embeddings import (
     ImageHintTimeEmbedding,
     ImageProjection,
     ImageTimeEmbedding,
-    PositionNet,
     TextImageProjection,
     TextImageTimeEmbedding,
     TextTimeEmbedding,
@@ -43,13 +42,28 @@ from diffusers.models.embeddings import (
     Timesteps,
 )
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.unet_2d_blocks import (
-    UNetMidBlock2D,
-    UNetMidBlock2DCrossAttn,
-    UNetMidBlock2DSimpleCrossAttn,
-    get_down_block,
-    get_up_block,
-)
+try:
+    from diffusers.models.unets.unet_2d_blocks import (
+        UNetMidBlock2D,
+        UNetMidBlock2DCrossAttn,
+        UNetMidBlock2DSimpleCrossAttn,
+        get_down_block,
+        get_up_block,
+    )
+except ImportError:
+    from diffusers.models.unet_2d_blocks import (
+        UNetMidBlock2D,
+        UNetMidBlock2DCrossAttn,
+        UNetMidBlock2DSimpleCrossAttn,
+        get_down_block,
+        get_up_block,
+    )
+
+
+try:
+    from diffusers.models.embeddings import PositionNet
+except ImportError:
+    from diffusers.models.embeddings import GLIGENTextBoundingboxProjection as PositionNet
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name

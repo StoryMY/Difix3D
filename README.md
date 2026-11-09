@@ -60,6 +60,56 @@ output_image.save("example_output.png")
 
 ### Training
 
+#### Fine-tune the pretrained reference model
+
+Use `--pretrained_model_name_or_path nvidia/difix_ref --mv_unet` to continue
+training from the released reference model (as in DI²FIX), rather than SD-Turbo.
+The UNet and VAE weights, including the existing VAE LoRA and skip connections,
+are loaded strictly. A local Hugging Face snapshot directory is also supported.
+This trains the full UNet, existing VAE decoder LoRA, and skip connections;
+the VAE base weights and text encoder stay frozen. No new UNet LoRA is added.
+
+For portraits, provide aligned degraded/clean pairs in `image` and `target_image`,
+and another image of the same person in `ref_image` for **every** train/test sample.
+Both views are supervised: the reference output is trained to reproduce `ref_image`.
+Use RGB images and absolute image paths. Images are resized to the square
+`--resolution`; prepare matching crops beforehand to avoid stretching portraits.
+Keep validation identities separate from training identities.
+
+Example in PowerShell, from the repository root:
+
+```powershell
+conda activate diffusion
+python -m pip install lpips  # if missing; other dependencies are in requirements.txt
+accelerate launch --num_processes 1 --mixed_precision bf16 src/train_difix.py `
+    --pretrained_model_name_or_path nvidia/difix_ref --mv_unet `
+    --dataset_path data/portraits.json --output_dir outputs/portraits `
+    --resolution 512 --train_batch_size 1 --gradient_accumulation_steps 4 `
+    --gradient_checkpointing --learning_rate 2e-6 --max_train_steps 1000 `
+    --lambda_l2 1 --lambda_lpips 1 --lambda_gram 0 --timestep 199 `
+    --checkpointing_steps 250 --eval_freq 250 --viz_freq 0 `
+    --report_to none --tracker_run_name portraits --seed 42
+```
+
+The learning rate above is a starting point, not a validated portrait recipe.
+Set `--report_to local --viz_freq 500` to save training comparisons every 500
+optimizer updates, without a W&B account or connection. `--report_to none`
+(the default) disables reporting and does not save comparison images.
+Images are written to `OUTPUT_DIR/visualizations/step_00000500/train/sample_00000.png`.
+Each PNG shows **Input | Reference | Target | Output**; the reference column is
+marked `N/A` in single-view mode. Images show the resized training inputs, and
+the output is from that training step's forward pass. Each item in the current
+main-process batch is saved (the last microbatch when accumulating gradients).
+Validation comparisons are saved under the step's `val/` directory at `--eval_freq`,
+up to `--num_samples_eval` images. `--viz_freq 0` disables training comparisons;
+`--eval_freq 0` disables validation. Only the main process writes these files.
+
+Use `--mixed_precision no` for FP32. The final checkpoint is always saved;
+periodic checkpoints contain the full UNet, VAE LoRA/skip weights, optimizer and learning-rate scheduler.
+To resume, keep the same model/data options and add
+`--resume outputs/portraits/checkpoints/model_1000.pkl` with a larger total
+`--max_train_steps`.
+
 #### Data Preparation
 
 Prepare your dataset in the following JSON format:
