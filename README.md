@@ -110,6 +110,27 @@ To resume, keep the same model/data options and add
 `--resume outputs/portraits/checkpoints/model_1000.pkl` with a larger total
 `--max_train_steps`.
 
+#### Optional UNet LoRA fine-tuning
+
+Use `--unet_lora_rank 4` to train only new LoRA adapters on UNet attention
+projections (`to_q`, `to_k`, `to_v`, `to_out.0`), freezing the UNet base.
+VAE training is independent: `--train_vae_lora true` (the Python default) trains
+its existing decoder LoRA and skip convolutions; `false` freezes the entire VAE.
+The text encoder stays frozen. Adapters start with zero contribution.
+`--unet_lora_rank 0` (the Python default) trains the full UNet.
+`scripts/run_train.sh` selects rank 4 and `train_vae_lora="false"`; use a new
+output directory for this experiment. Its other training settings are unchanged.
+
+LoRA `.pkl` checkpoints store UNet adapter weights, the existing VAE LoRA/skip
+weights, base model identifier, rank, view mode, optimizer, and scheduler.
+They require the original base model; they are not standalone full UNet weights.
+`src/inference_difix.py --model_path ... --ref_image ...` detects their rank and
+base automatically. `--model_name` can override the base location with a local
+copy of the same model. Resume training with the same base, view mode and
+`--unet_lora_rank` and `--train_vae_lora`, using the existing `--resume` option. Legacy full checkpoints
+keep their original format. FastGS-Pano's pipeline is unchanged and does not
+directly load this new adapter checkpoint format.
+
 #### Data Preparation
 
 Prepare your dataset in the following JSON format:

@@ -8,7 +8,7 @@ import torch
 from torchvision import transforms
 from transformers import CLIPTokenizer, CLIPTextModel
 from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler
-from peft import LoraConfig
+from peft import LoraConfig, inject_adapter_in_model
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 p = "src/"
@@ -87,6 +87,12 @@ def download_url(url, outf):
 
 def load_ckpt_from_state_dict(net_difix, optimizer, pretrained_path, lr_scheduler=None):
     sd = torch.load(pretrained_path, map_location="cpu")
+    if sd.get("unet_lora_rank", 0) != net_difix.unet_lora_rank:
+        raise ValueError("Resume requires the same --unet_lora_rank as the checkpoint.")
+    if sd.get("train_vae_lora", not bool(sd.get("unet_lora_rank", 0))) != net_difix.train_vae_lora:
+        raise ValueError("Resume requires the same --train_vae_lora setting as the checkpoint.")
+    if net_difix.unet_lora_rank and (sd["base_model"] != net_difix.base_name or sd["mv_unet"] != net_difix.mv_unet):
+        raise ValueError("LoRA resume requires the same base model and --mv_unet setting.")
     
     if "state_dict_vae" in sd:
         _sd_vae = net_difix.vae.state_dict()
@@ -126,9 +132,14 @@ def load_ckpt_from_state_dict(net_difix, optimizer, pretrained_path, lr_schedule
 
 def save_ckpt(net_difix, optimizer, outf, lr_scheduler=None):
     sd = {}
+    sd["train_vae_lora"] = net_difix.train_vae_lora
     sd["vae_lora_target_modules"] = net_difix.target_modules_vae
     sd["rank_vae"] = net_difix.lora_rank_vae
     sd["state_dict_unet"] = net_difix.unet.state_dict()
+    if net_difix.unet_lora_rank:
+        sd.update(unet_lora_rank=net_difix.unet_lora_rank, base_model=net_difix.base_name,
+                  mv_unet=net_difix.mv_unet)
+        sd["state_dict_unet"] = {k: v for k, v in sd["state_dict_unet"].items() if "lora_" in k}
     sd["state_dict_vae"] = {k: v for k, v in net_difix.vae.state_dict().items() if "lora" in k or "skip" in k}
     
     sd["optimizer"] = optimizer.state_dict()
@@ -139,10 +150,26 @@ def save_ckpt(net_difix, optimizer, outf, lr_scheduler=None):
 
 
 class Difix(torch.nn.Module):
-    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_vae=4, mv_unet=False, timestep=999):
+    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_vae=4, mv_unet=False, timestep=999, unet_lora_rank=0, train_vae_lora=True):
         super().__init__()
+        sd = torch.load(pretrained_path, map_location="cpu") if pretrained_path is not None else None
+        if sd is not None:
+            if unet_lora_rank and unet_lora_rank != sd.get("unet_lora_rank", 0):
+                raise ValueError("Checkpoint and requested UNet LoRA rank differ.")
+            unet_lora_rank = sd.get("unet_lora_rank", 0)
+            if unet_lora_rank:
+                pretrained_name = pretrained_name or sd["base_model"]
+                if mv_unet != sd["mv_unet"]:
+                    raise ValueError("LoRA checkpoint view mode differs; check ref_image / --mv_unet.")
+        if unet_lora_rank < 0:
+            raise ValueError("UNet LoRA rank must be non-negative.")
+        if unet_lora_rank and not pretrained_name:
+            raise ValueError("UNet LoRA training requires a pretrained Difix base model.")
+        self.unet_lora_rank = unet_lora_rank
+        self.train_vae_lora = train_vae_lora
         self.mv_unet = mv_unet
         base_name = pretrained_name or "stabilityai/sd-turbo"
+        self.base_name = str(base_name)
         self.tokenizer = CLIPTokenizer.from_pretrained(base_name, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(base_name, subfolder="text_encoder").cuda()
         self.sched = make_1step_sched(base_name, timestep)
@@ -173,7 +200,6 @@ class Difix(torch.nn.Module):
             unet = UNet2DConditionModel.from_pretrained(base_name, subfolder="unet")
 
         if pretrained_path is not None:
-            sd = torch.load(pretrained_path, map_location="cpu")
             vae_lora_config = LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian", target_modules=sd["vae_lora_target_modules"])
             vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
             self.lora_rank_vae = sd["rank_vae"]
@@ -216,6 +242,14 @@ class Difix(torch.nn.Module):
                 module.load_state_dict(load_file(filename), strict=True)
             print(f"Loaded pretrained weights from {pretrained_name}")
 
+        if unet_lora_rank:
+            inject_adapter_in_model(
+                LoraConfig(r=unet_lora_rank, lora_alpha=unet_lora_rank,
+                           init_lora_weights="gaussian",
+                           target_modules=["to_q", "to_k", "to_v", "to_out.0"]),
+                unet, adapter_name="portrait",
+            )
+
         if pretrained_path is not None:
             # Overlay last so the base model cannot overwrite fine-tuned weights.
             for component, module in (("unet", unet), ("vae", vae)):
@@ -233,6 +267,8 @@ class Difix(torch.nn.Module):
         self.vae.decoder.gamma = 1
         self.timesteps = torch.tensor([timestep], device="cuda").long()
         self.text_encoder.requires_grad_(False)
+        if not self.train_vae_lora:
+            self.vae.requires_grad_(False)
 
         # print number of trainable parameters
         print("="*50)
@@ -252,6 +288,16 @@ class Difix(torch.nn.Module):
         self.unet.requires_grad_(True)
         self.vae.requires_grad_(False)
         self.text_encoder.eval()
+
+        if self.unet_lora_rank:
+            self.unet.requires_grad_(False)
+            for name, param in self.unet.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad_(True)
+
+        if not self.train_vae_lora:
+            self.vae.eval()
+            return
 
         for n, _p in self.vae.named_parameters():
             if "lora" in n:

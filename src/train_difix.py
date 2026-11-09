@@ -58,6 +58,8 @@ def main(args):
     net_difix = Difix(
         pretrained_name=args.pretrained_model_name_or_path,
         lora_rank_vae=args.lora_rank_vae, 
+        unet_lora_rank=args.unet_lora_rank,
+        train_vae_lora=args.train_vae_lora == "true",
         timestep=args.timestep,
         mv_unet=args.mv_unet,
     )
@@ -83,8 +85,9 @@ def main(args):
     if args.lambda_gram > 0:
         net_vgg = torchvision.models.vgg16(pretrained=True).features.eval().requires_grad_(False)
 
-    # set_train selects the full UNet, VAE LoRA and skip connections.
+    # UNet and VAE training are configured independently in set_train.
     layers_to_opt = [p for p in net_difix.parameters() if p.requires_grad]
+    accelerator.print(f"Trainable parameters: {sum(p.numel() for p in layers_to_opt):,}")
 
     optimizer = torch.optim.AdamW(layers_to_opt, lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
@@ -311,6 +314,10 @@ if __name__ == "__main__":
     parser.add_argument("--variant", type=str, default=None,)
     parser.add_argument("--tokenizer_name", type=str, default=None)
     parser.add_argument("--lora_rank_vae", default=4, type=int)
+    parser.add_argument("--unet_lora_rank", default=0, type=int,
+                        help="0 trains the full UNet; positive rank trains only its attention LoRA.")
+    parser.add_argument("--train_vae_lora", choices=["true", "false"], default="true",
+                        help="Train existing VAE decoder LoRA and skip convolutions; false freezes the entire VAE.")
     parser.add_argument("--timestep", default=199, type=int)
     parser.add_argument("--mv_unet", action="store_true")
 

@@ -3,6 +3,11 @@ dataset_path="/path/to/json"
 output_dir="outputs/portraits"
 pretrained_model_name_or_path="nvidia/difix_ref"
 
+# UNet：0 为全量微调，正整数只训练注意力 LoRA
+unet_lora_rank="4"
+# VAE：独立控制已有 decoder LoRA 和 skip 卷积，false 冻结整个 VAE
+train_vae_lora="false"
+
 # GPU（单机；设为 1 使用单卡）
 num_gpus="8"
 
@@ -44,6 +49,8 @@ accelerate launch \
     --dataset_path "$dataset_path" \
     --output_dir "$output_dir" \
     --pretrained_model_name_or_path "$pretrained_model_name_or_path" \
+    --unet_lora_rank "$unet_lora_rank" \
+    --train_vae_lora "$train_vae_lora" \
     --learning_rate "$learning_rate" \
     --max_train_steps "$max_train_steps" \
     --resolution "$resolution" \
