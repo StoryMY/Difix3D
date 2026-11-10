@@ -12,7 +12,7 @@ if __name__ == "__main__":
     # Argument parser
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_image', type=str, required=True, help='Path to the input image or directory')
-    parser.add_argument('--ref_image', type=str, default=None, help='Path to the reference image or directory')
+    parser.add_argument('--ref_image', type=str, default=None, help='Reference image or directory; a single reference is shared by all inputs')
     parser.add_argument('--height', type=int, default=576, help='Height of the input image')
     parser.add_argument('--width', type=int, default=1024, help='Width of the input image')
     parser.add_argument('--prompt', type=str, required=True, help='The prompt to be used')
@@ -49,7 +49,10 @@ if __name__ == "__main__":
         else:
             ref_images = [args.ref_image]
 
-        assert len(input_images) == len(ref_images), "Number of input images and reference images should be the same"
+        if len(ref_images) == 1:
+            ref_images = ref_images * len(input_images)
+        elif len(ref_images) != len(input_images):
+            raise ValueError("Provide one shared reference image or one reference per input image.")
 
     # Process images
     output_images = []
